@@ -31,7 +31,7 @@ import http from "node:http"
 import net from "node:net"
 import crypto from "node:crypto"
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
-import { dirname, extname, join, normalize, resolve, sep } from "node:path"
+import { basename, dirname, extname, join, normalize, resolve, sep } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import {
   DEFAULT_PORT,
@@ -1988,12 +1988,23 @@ export async function startDaemon(opts = {}) {
       if (!existsSync(file)) return
       const raw = readJson(file, null)
       if (!raw || !Array.isArray(raw.plugins)) return
-      const mine = raw.plugins.filter((x) => String(x?.spec ?? "").includes(PLUGIN_NAME))
+      // 判断「本插件是否仍在 magpie 里」。只靠 spec 里的名字不可靠：magpie 用 package.json
+      // 的 name 建安装目录，而 spec 是安装来源，仓库改过名就对不上 PLUGIN_NAME
+      // （例如 .../magpie-workbuddy-autotasks.git）。因此加一条更本质的信号：本插件的
+      // 安装目录是否还在——卸载时 magpie 会把它删掉。任一成立即视为仍被安装。
+      const selfDir = dirname(fileURLToPath(import.meta.url))
+      const selfName = basename(selfDir)
+      const mine = raw.plugins.filter((x) => {
+        const spec = String(x?.spec ?? "")
+        return spec.includes(PLUGIN_NAME) || (selfName ? spec.includes(selfName) : false)
+      })
       if (mine.some((x) => x.off === true)) {
         shutdown("插件在 magpie 里已关闭（plugins.json off:true）")
         return
       }
-      if (managed && !mine.length) shutdown("插件已从 magpie 移除（plugins.json 无本插件条目）")
+      if (managed && !mine.length && !existsSync(selfDir)) {
+        shutdown("插件已从 magpie 移除（plugins.json 无本插件条目，安装目录也已删除）")
+      }
     } catch (e) {
       log("[plugins.json] " + shortErr(e))
     }
