@@ -303,30 +303,51 @@ node --test "tests/**/*.test.mjs" "tests-shell/*.test.mjs" "tests-e2e/*.test.mjs
 
 ### 自动跟随上游
 
-`tools/sync-upstream.sh` 每 5 分钟被 `tools/systemd/magpie-wbtasks-sync.timer` 唤起：
+仓库自带 GitHub Actions workflow [`.github/workflows/sync-upstream.yml`](./.github/workflows/sync-upstream.yml)，每 6 小时自动跑一次：
 
 ```
-拉上游 → 归一化行尾（上游是 CRLF，补丁按 LF）→ 打补丁 → 8 项断言
-→ 备份现有安装 → rsync 进 magpie 卷 → 重启容器 → 健康检查 → 失败自动回滚
+按 commit sha 拉上游快照 → 归一化行尾（上游 CRLF、补丁 LF）
+→ 重放 tools/local-changes.patch（先 --fuzz=0 精确匹配，不行再 fuzz=2）
+→ 8 项断言（4 处改动必须真的在）→ 覆盖工作树（保留本仓库自有文件）
+→ 有差异就 commit + push 到 main
 ```
 
-补丁与上游冲突时**不会部署**，staging 原样保留供人工处理：
+- **手动跑**：Actions → **Sync upstream** → Run workflow；勾 `dry_run` 只输出差异，不提交不推送。
+- **外部触发**：`POST /repos/MeYangGe/magpie-workbuddy-autotasks/dispatches`，body `{"event_type":"sync-upstream"}`。
+- **前提**：`Settings → Actions → General → Workflow permissions` 选 **Read and write**，否则 push 会被拒。
+
+| 情况 | workflow 行为 |
+| --- | --- |
+| 上游没变 | 不产生任何提交 |
+| 上游有新提交 | 产生一个 `chore(sync): 跟随上游 <sha>` 提交，正文带完整上游 sha |
+| 上游改动了补丁旁边的代码 | `fuzz=2` 兜住，summary 标注「建议复核」 |
+| 补丁打不上 | 失败退出（GitHub 给仓库管理员发邮件），**不推送、不动工作树**，summary 写明怎么重做补丁 |
+| 上游自己合并了同样改动 | 跳过补丁重放，由断言兜底 |
+
+补丁冲突后的修法：
 
 ```bash
-/opt/wbtasks-sync/sync-upstream.sh --stage-only     # 只准备，不动线上
-/opt/wbtasks-sync/sync-upstream.sh --check           # 只看上游有没有更新（退出码 10 = 有）
-/opt/wbtasks-sync/sync-upstream.sh --force           # 上游没更新也重新部署
-journalctl -u magpie-wbtasks-sync -n 50              # 同步日志
-systemctl disable --now magpie-wbtasks-sync.timer    # 关掉自动同步
+# 1) 解出上游快照
+curl -fsSL https://codeload.github.com/jichie/magpie-workbuddy-tasks/tar.gz/<上游 sha> | tar xz
+# 2) 对照上游新代码，把 4 处改动重做一遍（清单见上一节）
+# 3) 重新生成补丁并推上去，workflow 下次运行自动重试
+git add -N page/embed.js          # 新增文件也要进补丁
+git diff > tools/local-changes.patch
 ```
 
-手动同步、systemd 安装步骤见 [install.md](./install.md#跟随上游更新可选)。
+**本仓库自有、不被上游覆盖的路径**：`.github/`、`tools/`、`README.md`、`install.md`、`.gitignore`。上游若改了这些同名文件，workflow 会在 summary 里提示「上游版本与本地不同」，但保持本地版本——要跟进就手工比对。
+
+> GitHub 的 `schedule` 不保证准点，高峰期可能延迟几十分钟；仓库连续 60 天没有任何提交时会被自动暂停，给仓库点个 star 或手动 Run 一次可恢复。
+
+### 想让 magpie 直接吃到上游更新（可选）
+
+上面那条链路只更新**仓库**。如果你自建了 magpie、想让它连容器里的插件也跟上上游，可以把同一个补丁重放到服务器上：`tools/sync-upstream.sh` + `tools/systemd/magpie-wbtasks-sync.timer`，做法见 [install.md](./install.md#跟随上游更新可选)。
 
 ### 三条要掂量的
 
-1. **自动同步等于自动执行上游代码**。上游若被投毒或误提交，脚本这一层识别不出来，只能靠备份回滚和变更日志追查。介意就关掉 timer，改成 `--stage-only` + 人工复核后 `--force`。
-2. **补丁只覆盖 4 个代码文件**，不含 `README.md` / `install.md`：这两份上游改得勤，纳入补丁会让同步动不动就冲突停摆。所以容器里那份文档会回到上游原版，本文件的改动只存在于仓库。
-3. **上游新增 npm 依赖时脚本不会安装**。`node_modules` 由 magpie 的 `plugin add` 管理，脚本只覆盖插件自己的文件；遇到上游加依赖，需要 `magpie plugin remove` + `add` 重装一次。
+1. **自动同步等于自动执行上游代码**。上游若被投毒或误提交，workflow 只能保证「补丁打得干净、改动没丢」，判断不了代码本身是否恶意。介意就把 workflow 里的 `schedule` 注释掉，只留手动触发 + `dry_run` 复核。
+2. **补丁只覆盖 4 个代码文件**，不含 `README.md` / `install.md`：这两份上游改得勤，纳入补丁会让同步动不动就冲突停摆。所以仓库文档永远是本分支的版本，上游更新只在 summary 里提示。
+3. **上游新增 npm 依赖时 workflow 不会安装**。`node_modules` 由 magpie 的 `plugin add` 管理，workflow 只管仓库里的文件；遇到上游加依赖，需要 `magpie plugin remove` + `add` 重装一次。
 
 ## 来源与致谢
 

@@ -129,9 +129,22 @@ node daemon.mjs --state ./tmp/state --cfg ./tmp/cfg --port 4390
 
 ## 跟随上游更新（可选）
 
-本仓库是上游的衍生分支，改动集中在 4 个文件（清单见 README「与上游的关系」）。上游持续发版时，与其手动 rebase，不如让脚本自动重放补丁。
+本仓库是上游的衍生分支，改动集中在 4 个文件（清单见 README「与上游的关系」）。上游持续发版时，与其手动 rebase，不如让补丁自动重放。两条路，按需要选：
 
-### 一次性安装（在跑 magpie 的宿主机上，root，仓库根目录执行）
+| 路线 | 跑在哪 | 效果 |
+| --- | --- | --- |
+| **A. GitHub Actions**（已默认开启，推荐） | GitHub 托管 | 仓库自动跟上游；你随时 `magpie plugin remove` + `add` 一次就是最新版 |
+| **B. 自建服务器定时同步** | 你的 magpie 宿主机 | 不重装插件，上游一变就把文件同步进插件目录并重启容器 |
+
+### 路线 A：仓库自动跟随（默认，无需操作）
+
+`.github/workflows/sync-upstream.yml` 每 6 小时把上游快照拉下来、重放本地补丁、跑 8 项断言，有差异就提交推送到 `main`。手动触发与冲突处理见 README[「自动跟随上游」](./README.md#自动跟随上游)。
+
+唯一需要确认的仓库设置：`Settings → Actions → General → Workflow permissions` 选 **Read and write**，否则推送会被拒。
+
+### 路线 B：把上游更新直接部署进容器
+
+#### 一次性安装（在跑 magpie 的宿主机上，root，仓库根目录执行）
 
 ```bash
 # 1) 目录与文件
@@ -153,7 +166,7 @@ systemctl enable --now magpie-wbtasks-sync.timer
 systemctl list-timers | grep wbtasks
 ```
 
-### 环境变量
+#### 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -163,7 +176,7 @@ systemctl list-timers | grep wbtasks
 | `CONTAINER` | `magpie` | 需要重启的容器名 |
 | `KEEP_BACKUPS` | `5` | 保留几份备份（`/opt/wbtasks-sync/backups/plugin-<时间戳>`） |
 
-### 退出码
+#### 退出码
 
 | 码 | 含义 | 怎么处理 |
 | --- | --- | --- |
@@ -172,7 +185,7 @@ systemctl list-timers | grep wbtasks
 | 3 | 断言失败（改动没打全或语法错） | 同上 |
 | 4 | 部署后健康检查失败 | 已自动回滚，看 `journalctl -u magpie-wbtasks-sync` |
 
-### 手动回滚
+#### 手动回滚
 
 ```bash
 ls -1dt /opt/wbtasks-sync/backups/plugin-* | head -1      # 最近一次备份
@@ -181,7 +194,7 @@ rsync -a --delete /opt/wbtasks-sync/backups/plugin-<时间戳>/ \
 docker restart magpie
 ```
 
-### 安全提醒
+#### 安全提醒
 
 自动同步 = 自动执行上游代码。脚本只在「补丁精确应用 + 8 项断言全过 + 健康检查通过」时才保留新版本，其余情况一律回滚；但它**无法判断上游代码本身是否恶意**。不想承担这条风险就停掉定时器：
 

@@ -1,0 +1,252 @@
+name: Sync upstream
+
+# ---------------------------------------------------------------------------
+# 让本仓库自动跟随上游 jichie/magpie-workbuddy-tasks。
+#
+# 每一步：
+#   1. 解析上游 main 的 commit sha（git ls-remote，不占 API 配额）
+#   2. 下载该 sha 的源码快照，归一化行尾（上游是 CRLF，本地补丁按 LF 生成）
+#   3. 重放 tools/local-changes.patch（精确匹配，不行才 fuzz=2）
+#   4. 8 项断言：4 处本地改动必须真的在，防止补丁错位或上游重写导致静默丢失
+#   5. 覆盖工作树，但保留本仓库自有文件：
+#        .github/  tools/  README.md  install.md  .gitignore
+#   6. 有差异就提交并推送（提交信息带上游 sha，便于追溯）
+#
+# 补丁与上游冲突时**不推送**，workflow 直接失败（GitHub 会给仓库管理员发邮件），
+# 处理方式见 step summary 与 README「自动跟随上游」。
+#
+# 手动触发：Actions → Sync upstream → Run workflow，可勾 dry_run 只看差异。
+# 外部触发：POST /repos/<owner>/<repo>/dispatches，event_type=sync-upstream。
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    # 每 6 小时一次。GitHub 的 schedule 不保证准点（高峰期可能延迟几十分钟），
+    # 也不保证分钟级——要更实时请用 repository_dispatch 从自己的定时器触发。
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只检查并输出差异，不提交、不推送"
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [sync-upstream]
+
+# 需要写仓库内容才能提交上游同步
+permissions:
+  contents: write
+
+# 定时与手动触发可能撞上，排队而不是并发覆盖
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: jichie/magpie-workbuddy-tasks
+  UPSTREAM_BRANCH: main
+  PATCH_FILE: tools/local-changes.patch
+  # 本仓库自有、不被上游覆盖的路径
+  KEEP_PATHS: ".github tools README.md install.md .gitignore"
+
+jobs:
+  sync:
+    name: follow upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream commit
+        id: upstream
+        run: |
+          set -Eeuo pipefail
+          sha="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/heads/${UPSTREAM_BRANCH}" | awk '{print $1}')"
+          if [ -z "$sha" ]; then
+            echo "::error::取不到上游 ${UPSTREAM_BRANCH} 的 commit（上游改名/删库/网络问题）"
+            exit 1
+          fi
+          echo "UPSTREAM_SHA=$sha" >> "$GITHUB_ENV"
+          echo "上游 ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} = $sha"
+
+      - name: Download upstream snapshot
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -o /tmp/upstream.tar.gz \
+            "https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/${UPSTREAM_SHA}"
+          rm -rf /tmp/upstream && mkdir -p /tmp/upstream
+          tar -xzf /tmp/upstream.tar.gz -C /tmp/upstream --strip-components=1
+
+          # 行尾归一化：上游仓库用 CRLF，本地补丁按 LF 生成，不归一化必然全部冲突
+          find /tmp/upstream -type f \
+            \( -name '*.mjs' -o -name '*.js' -o -name '*.json' -o -name '*.html' \
+               -o -name '*.css' -o -name '*.md' -o -name '*.yml' -o -name '*.yaml' \) \
+            -exec sed -i 's/\r$//' {} +
+
+          echo "上游文件数：$(find /tmp/upstream -type f | wc -l)"
+
+      - name: Replay local patch
+        run: |
+          set -Eeuo pipefail
+          # 注意 --fuzz：GNU patch 默认就允许 fuzz=2，不显式写 --fuzz=0 的话
+          # 「精确匹配」其实并不精确，上游动了相邻行也会静默通过。
+          # --forward：禁止「检测到已应用就自动反向」，否则打错方向也返回 0。
+          opts=(-p1 --batch --silent --forward)
+          if patch -d /tmp/upstream "${opts[@]}" --fuzz=0 --dry-run < "$PATCH_FILE" >/dev/null 2>&1; then
+            patch -d /tmp/upstream "${opts[@]}" --fuzz=0 < "$PATCH_FILE"
+            echo "补丁：精确匹配"
+            echo "FUZZY=0" >> "$GITHUB_ENV"
+          elif patch -d /tmp/upstream "${opts[@]}" --fuzz=2 --dry-run < "$PATCH_FILE" >/dev/null 2>&1; then
+            patch -d /tmp/upstream "${opts[@]}" --fuzz=2 < "$PATCH_FILE"
+            echo "::warning::补丁靠 fuzz=2 才应用：上游改动了相邻代码，请人工复核 daemon.mjs"
+            echo "FUZZY=1" >> "$GITHUB_ENV"
+          elif patch -d /tmp/upstream -p1 --batch --silent -R --dry-run < "$PATCH_FILE" >/dev/null 2>&1; then
+            # 上游自己合并了同样的改动（好事），补丁无需重放，断言会兜住
+            echo "::notice::上游已包含这 4 处改动，跳过补丁重放"
+            echo "FUZZY=0" >> "$GITHUB_ENV"
+          else
+            {
+              echo "## 补丁与上游冲突，未同步"
+              echo ""
+              echo "上游 commit：\`${UPSTREAM_SHA}\`"
+              echo ""
+              echo "本地处理："
+              echo ""
+              echo '```bash'
+              echo "# 1) 解出上游快照"
+              echo "curl -fsSL https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/${UPSTREAM_SHA} | tar xz"
+              echo "# 2) 对照上游新代码，把这 4 处改动重做一遍"
+              echo "#    清单见 README「相对上游的改动」"
+              echo "# 3) 用改动后的文件重新生成补丁，覆盖 tools/local-changes.patch："
+              echo "git add -N page/embed.js      # 新增文件也要进补丁"
+              echo "git diff > tools/local-changes.patch"
+              echo "# 4) 手动跑一次本 workflow 验证（Actions → Sync upstream → Run workflow）"
+              echo '```'
+              echo ""
+              echo "推上去之后 workflow 会自动重试，不需要改 workflow 本身。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::本地补丁打不上上游 ${UPSTREAM_SHA:0:12}，需要人工重新生成补丁"
+            exit 1
+          fi
+          # fuzz 应用可能留下备份/拒绝文件，别带进仓库
+          find /tmp/upstream -name '*.orig' -delete
+          find /tmp/upstream -name '*.rej' -delete
+
+      - name: Assert local changes are present
+        run: |
+          set -Eeuo pipefail
+          fail=0
+          chk() {
+            if eval "$2" >/dev/null 2>&1; then echo "  OK   $1";
+            else echo "  FAIL $1"; echo "::error::断言失败：$1"; fail=1; fi
+          }
+          chk "CORS: ACAO null"         "grep -q 'Access-Control-Allow-Origin\", \"null\"' /tmp/upstream/daemon.mjs"
+          chk "CORS: OPTIONS 预检"      "grep -q 'Access-Control-Max-Age' /tmp/upstream/daemon.mjs"
+          chk "生命周期: selfName"      "grep -q 'const selfName = basename(selfDir)' /tmp/upstream/daemon.mjs"
+          chk "生命周期: 目录存在兜底"  "grep -q 'existsSync(selfDir)' /tmp/upstream/daemon.mjs"
+          chk "page.service 声明"       "python3 -c \"import json,sys; d=json.load(open('/tmp/upstream/package.json')); sys.exit(0 if d['magpie']['page'].get('service',{}).get('port')==4390 else 1)\""
+          chk "embed.js 存在"           "test -f /tmp/upstream/page/embed.js && grep -q 'location.replace' /tmp/upstream/page/embed.js"
+          chk "index.html 引入 embed.js" "grep -q 'embed.js' /tmp/upstream/page/index.html"
+          chk "package.json 可解析"     "python3 -m json.tool /tmp/upstream/package.json"
+          [ "$fail" -eq 0 ] || { echo "::error::补丁打上了但改动不完整，拒绝同步"; exit 1; }
+
+          if command -v node >/dev/null 2>&1; then
+            node --check /tmp/upstream/daemon.mjs
+            echo "daemon.mjs 语法 OK"
+          else
+            echo "::warning::环境里没有 node，跳过 daemon.mjs 语法检查"
+          fi
+
+      - name: Apply snapshot to worktree
+        run: |
+          set -Eeuo pipefail
+          # runner 镜像自带 rsync；万一没有就装一个
+          if ! command -v rsync >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq rsync
+          fi
+          # .git 必须显式排除：--delete 会连版本库一起删掉，后面就没法提交了
+          excludes=(--exclude='/.git')
+          for p in $KEEP_PATHS; do excludes+=(--exclude="/$p"); done
+          # 只删除上游没有、又不是本仓库自有的文件；自有文件原样保留
+          rsync -a --delete "${excludes[@]}" /tmp/upstream/ ./
+          echo "工作树已更新（保留：.git $KEEP_PATHS）"
+
+      - name: Report upstream changes to kept files
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "## 上游同步 ${UPSTREAM_SHA:0:12}"
+            echo ""
+            echo "- 上游：[\`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`](https://github.com/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA})"
+            echo "- 补丁：$([ "${FUZZY:-0}" = "1" ] && echo 'fuzz=2 模糊匹配（建议复核）' || echo '精确匹配')"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # README/install.md/.gitignore 是我们自己维护的，上游改了不会自动合并，这里点出来
+          note=""
+          for f in $KEEP_PATHS; do
+            case "$f" in *.md|.gitignore) ;; *) continue ;; esac
+            if [ -f "/tmp/upstream/$f" ] && ! diff -q "$f" "/tmp/upstream/$f" >/dev/null 2>&1; then
+              note="${note}- \`$f\`：上游版本与本地不同（本地保留，需要时手工比对）"$'\n'
+            fi
+          done
+          if [ -n "$note" ]; then
+            { echo "### 需要留意的自有文件"; echo ""; printf '%s' "$note"; echo ""; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Commit and push
+        run: |
+          set -Eeuo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "已与上游 ${UPSTREAM_SHA:0:12} 一致，无需提交"
+            echo "- 结果：已是最新，无变更" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### 变更"
+            echo ""
+            echo '```'
+            git diff --cached --stat | tail -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          git commit -q -F - <<MSG
+          chore(sync): 跟随上游 ${UPSTREAM_SHA:0:12}
+
+          Upstream-Repo: https://github.com/${UPSTREAM_REPO}
+          Upstream-Commit: ${UPSTREAM_SHA}
+          Patch: ${PATCH_FILE} ($([ "${FUZZY:-0}" = "1" ] && echo "fuzz=2" || echo "exact"))
+          MSG
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "::notice::dry_run：已生成提交但未推送"
+            git --no-pager show --stat --oneline HEAD
+            exit 0
+          fi
+
+          git push origin "HEAD:${UPSTREAM_BRANCH}"
+          echo "- 结果：已提交并推送" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hints on failure
+        if: failure()
+        run: |
+          {
+            echo ""
+            echo "### 失败后怎么办"
+            echo ""
+            echo '```bash'
+            echo "git pull                      # 本地仓库同步最新一次成功的同步"
+            echo "gh run view --log-failed      # 看这次是哪一步挂了"
+            echo '```'
+            echo ""
+            echo "- 补丁冲突 → 按上游新代码手工调整 4 处改动，重新生成 \`tools/local-changes.patch\`"
+            echo "- 推送被拒 → 检查分支保护规则，或把本 workflow 改成「推送分支 + 开 PR」"
+            echo "- 断言失败 → 上游可能重写了相关函数，改动被静默吞掉，必须人工确认"
+          } >> "$GITHUB_STEP_SUMMARY"
