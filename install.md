@@ -126,3 +126,65 @@ node daemon.mjs --state ./tmp/state --cfg ./tmp/cfg --port 4390
 
 - 临时停用：magpie 插件管理里关掉本插件 → 守护进程 10 秒内读到 `plugins.json` 的 `off:true` 会优雅退出；再打开即恢复（下次宿主加载时拉起，或用 README 里的手动命令立刻拉起）。
 - 彻底移除：`magpie plugin remove <名字>`；托管模式下守护进程发现条目消失即自杀。想连状态一起清掉，删除 `<magpie 配置目录>/workbuddy-tasks/` 即可——里面只有排程设置、历史与快照，**没有登录凭据**；`plugin-auth.json` 由 magpie/社区插件拥有，本插件从不删除它。
+
+## 跟随上游更新（可选）
+
+本仓库是上游的衍生分支，改动集中在 4 个文件（清单见 README「与上游的关系」）。上游持续发版时，与其手动 rebase，不如让脚本自动重放补丁。
+
+### 一次性安装（在跑 magpie 的宿主机上，root，仓库根目录执行）
+
+```bash
+# 1) 目录与文件
+mkdir -p /opt/wbtasks-sync/backups /opt/wbtasks-sync/state
+install -m 755 tools/sync-upstream.sh      /opt/wbtasks-sync/sync-upstream.sh
+install -m 644 tools/local-changes.patch   /opt/wbtasks-sync/local-changes.patch
+
+# 2) 空跑一次：只准备 staging，不动线上
+/opt/wbtasks-sync/sync-upstream.sh --stage-only
+
+# 3) 正式部署一次
+/opt/wbtasks-sync/sync-upstream.sh --force
+
+# 4) 挂定时器（每 5 分钟检查一次上游）
+install -m 644 tools/systemd/magpie-wbtasks-sync.service /etc/systemd/system/
+install -m 644 tools/systemd/magpie-wbtasks-sync.timer   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now magpie-wbtasks-sync.timer
+systemctl list-timers | grep wbtasks
+```
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `UPSTREAM_REPO` | `https://github.com/jichie/magpie-workbuddy-tasks.git` | 上游地址 |
+| `PROXY` | `http://127.0.0.1:7891` | 拉 GitHub 用的 HTTP 代理；能直连就设成空串 |
+| `INSTALL_DIR` | magpie 配置卷里的插件目录 | 部署目标 |
+| `CONTAINER` | `magpie` | 需要重启的容器名 |
+| `KEEP_BACKUPS` | `5` | 保留几份备份（`/opt/wbtasks-sync/backups/plugin-<时间戳>`） |
+
+### 退出码
+
+| 码 | 含义 | 怎么处理 |
+| --- | --- | --- |
+| 0 | 成功 / 上游无更新 | — |
+| 2 | 补丁与上游冲突 | 手工改 `/opt/wbtasks-sync/staging`，把结果回写成新补丁，再 `--force` |
+| 3 | 断言失败（改动没打全或语法错） | 同上 |
+| 4 | 部署后健康检查失败 | 已自动回滚，看 `journalctl -u magpie-wbtasks-sync` |
+
+### 手动回滚
+
+```bash
+ls -1dt /opt/wbtasks-sync/backups/plugin-* | head -1      # 最近一次备份
+rsync -a --delete /opt/wbtasks-sync/backups/plugin-<时间戳>/ \
+  /var/lib/docker/volumes/magpie_magpie-config/_data/magpie/plugins/node_modules/magpie-workbuddy-tasks/
+docker restart magpie
+```
+
+### 安全提醒
+
+自动同步 = 自动执行上游代码。脚本只在「补丁精确应用 + 8 项断言全过 + 健康检查通过」时才保留新版本，其余情况一律回滚；但它**无法判断上游代码本身是否恶意**。不想承担这条风险就停掉定时器：
+
+```bash
+systemctl disable --now magpie-wbtasks-sync.timer
+```

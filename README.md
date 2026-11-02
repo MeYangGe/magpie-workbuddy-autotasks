@@ -2,13 +2,15 @@
 
 把 WorkBuddy **国内版**的成长任务、猫猫旅行、夜猫子、每日活跃与积分查询做成 magpie 插件：复用你在 magpie 里已经登录的 WorkBuddy 账号，提供本地看板、北京时间小时排程，以及给任意智能体用的 MCP 工具。**不需要、也不接受任何密钥。**
 
-- 仓库：<https://github.com/jichie/magpie-workbuddy-tasks>
-- 安装：`magpie plugin add github:jichie/magpie-workbuddy-tasks`
+- **上游**（全部功能来自这里）：<https://github.com/jichie/magpie-workbuddy-tasks>
+- **本分支**（上游 + 内嵌看板等改动）：<https://github.com/MeYangGe/magpie-workbuddy-autotasks>
+- 安装：`magpie plugin add github:MeYangGe/magpie-workbuddy-autotasks`
 - 只服务国内版 `workbuddy` 账号；国际版 `workbuddy-ai` 不会出现在插件里。
+- 与上游的差异、自动跟随上游的方式见 [与上游的关系](#与上游的关系本分支)。
 
 ## 快速开始
 
-1. 在已登录 WorkBuddy 国内版的 magpie 上执行 `magpie plugin add github:jichie/magpie-workbuddy-tasks`，并在插件管理里启用。
+1. 在已登录 WorkBuddy 国内版的 magpie 上执行 `magpie plugin add github:MeYangGe/magpie-workbuddy-autotasks`，并在插件管理里启用。
 2. 打开「WorkBuddy 任务」入口卡，进入看板；首次加载会读取账号与任务快照。
 3. 排程默认是关的。想手动跑：勾选账号和任务腿，点「批量做任务」；只想接取/领奖就用对应按钮。
 4. 任务明细里可勾选任务，批量操作只做选中的；积分列会显示余额，点「明细」看套餐权益包。
@@ -93,7 +95,7 @@
 GitHub 安装：
 
 ```bash
-magpie plugin add github:jichie/magpie-workbuddy-tasks
+magpie plugin add github:MeYangGe/magpie-workbuddy-autotasks
 ```
 
 首次 `add` 如果提示 `the plugin's load didn't finish in 20s`：这是 Bun 第一次现场拉取 `@opencode-ai/plugin` 的冷启动开销（群晖容器实测冷启动可到 45s，热启动约 23ms）。拉取会在后台完成并进缓存，**再 add 一次，或在插件管理里停用→启用一次**即可。
@@ -185,6 +187,16 @@ magpie plugin add /path/to/magpie-workbuddy-tasks
   - 默认只绑 `127.0.0.1`，只有本机进程能访问；
   - Docker 里只有把 `options.listenAddress` 设为 `"0.0.0.0"` 才会暴露到容器网桥/局域网；
   - **不要把 4390 发布到公网或开放的 LAN**。能连上端口的人可以触发任务、写入 `plugin-auth.json`、下载含 token 的导出、关停守护进程。
+- **内嵌模式把边界从「4390 端口」换成了「magpie 的 Web 界面」**（本分支特有）：声明 `magpie.page.service` 后，magpie 会把 `/_magpie/plugin/<token>/_magpie/service/*` 反代到 4390，而这条反代路径**不校验 magpie 会话**——实测不带任何 Cookie 也返回 `200`。因此只要能访问 magpie 的 HTTP 端口（含经 nginx 反代的域名），并知道插件页 URL 里的 `token`，就能读写全部看板 API，**包括含 token 的账号导出**。token 是 32 位十六进制、不可枚举，但性质是「知道即有权」，会出现在浏览器地址栏、iframe `src` 和 nginx access log 里。**magpie 一旦暴露在公网，必须在反代层给 `/_magpie/` 加认证或来源限制**，否则不要启用内嵌模式：
+
+  ```bash
+  # 自检：从外部访问应当 401/403/404；返回 200 说明看板 API 已经裸奔
+  curl -o /dev/null -w '%{http_code}\n' \
+    https://<你的 magpie 域名>/_magpie/plugin/<token>/_magpie/service/api/hello
+  ```
+
+  `token` 取自登录后 `GET /api/plugin-pages` 里 `url` 字段的第 3 段；`api/hello` 只返回版本（无账号信息），可安全用于探测。
+
 - 跨机器访问推荐 SSH 隧道（隧道本身就是鉴权）：
 
   ```bash
@@ -273,6 +285,48 @@ node --test "tests/**/*.test.mjs" "tests-shell/*.test.mjs" "tests-e2e/*.test.mjs
 ```
 
 当前 **303 个测试全绿**，全部零真实网络：上游由脚本化假 WorkBuddy 提供，时钟可注入；覆盖限速红线、风控冷却、任务勾选、北京时间排程、积分解析、导入导出、凭据回写等。
+
+## 与上游的关系（本分支）
+
+功能全部来自上游 [jichie/magpie-workbuddy-tasks](https://github.com/jichie/magpie-workbuddy-tasks)。本分支（[MeYangGe/magpie-workbuddy-autotasks](https://github.com/MeYangGe/magpie-workbuddy-autotasks)）只做一件事：**让看板在 magpie 窗口里直接可用**，不改 `magpie` 本体一行。
+
+### 相对上游的改动
+
+| 文件 | 改动 | 为什么必须这么改 |
+| --- | --- | --- |
+| `package.json` | `magpie.page.service = { "port": 4390 }` | 让 magpie 把 `_magpie/service/` 反代到守护进程 |
+| `page/embed.js`（新增） | `magpie.ready` 之后 `location.replace(magpie.service)` | 插件页 CSP 是 `frame-src 'none'`，无法嵌 iframe，只能整页自导航进去 |
+| `page/index.html` | 外链引入 `embed.js` | 页面 CSP 没有 `unsafe-inline`，内联脚本会被直接丢弃 |
+| `daemon.mjs` | ① `serverOf` 包一层 CORS：对 `Origin: null` 回 `Access-Control-Allow-Origin: null`，并自答 OPTIONS 预检<br>② `checkPluginsFile` 增加「安装目录仍存在」兜底 | ① 沙箱帧是不透明源，不补 CORS 取不回数据；带 JSON 的 POST 会先发预检，光加 ACAO 头不够<br>② 仓库改名后 `spec.includes(PLUGIN_NAME)` 不再命中，托管模式会把插件误判成「已从 magpie 移除」并自杀（表现为看板 `connection refused`） |
+
+这 4 处也被固化成补丁 `tools/local-changes.patch`，供同步脚本重放。
+
+### 自动跟随上游
+
+`tools/sync-upstream.sh` 每 5 分钟被 `tools/systemd/magpie-wbtasks-sync.timer` 唤起：
+
+```
+拉上游 → 归一化行尾（上游是 CRLF，补丁按 LF）→ 打补丁 → 8 项断言
+→ 备份现有安装 → rsync 进 magpie 卷 → 重启容器 → 健康检查 → 失败自动回滚
+```
+
+补丁与上游冲突时**不会部署**，staging 原样保留供人工处理：
+
+```bash
+/opt/wbtasks-sync/sync-upstream.sh --stage-only     # 只准备，不动线上
+/opt/wbtasks-sync/sync-upstream.sh --check           # 只看上游有没有更新（退出码 10 = 有）
+/opt/wbtasks-sync/sync-upstream.sh --force           # 上游没更新也重新部署
+journalctl -u magpie-wbtasks-sync -n 50              # 同步日志
+systemctl disable --now magpie-wbtasks-sync.timer    # 关掉自动同步
+```
+
+手动同步、systemd 安装步骤见 [install.md](./install.md#跟随上游更新可选)。
+
+### 三条要掂量的
+
+1. **自动同步等于自动执行上游代码**。上游若被投毒或误提交，脚本这一层识别不出来，只能靠备份回滚和变更日志追查。介意就关掉 timer，改成 `--stage-only` + 人工复核后 `--force`。
+2. **补丁只覆盖 4 个代码文件**，不含 `README.md` / `install.md`：这两份上游改得勤，纳入补丁会让同步动不动就冲突停摆。所以容器里那份文档会回到上游原版，本文件的改动只存在于仓库。
+3. **上游新增 npm 依赖时脚本不会安装**。`node_modules` 由 magpie 的 `plugin add` 管理，脚本只覆盖插件自己的文件；遇到上游加依赖，需要 `magpie plugin remove` + `add` 重装一次。
 
 ## 来源与致谢
 

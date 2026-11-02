@@ -1,0 +1,12 @@
+[Unit]
+Description=定时检查上游更新（magpie-workbuddy-autotasks）
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=90s
+Persistent=true
+Unit=magpie-wbtasks-sync.service
+
+[Install]
+WantedBy=timers.target

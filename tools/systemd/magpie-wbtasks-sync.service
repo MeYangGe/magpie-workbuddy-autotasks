@@ -1,0 +1,19 @@
+[Unit]
+Description=magpie-workbuddy-autotasks：从上游同步并重放本地改动
+Documentation=https://github.com/MeYangGe/magpie-workbuddy-autotasks
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PROXY=http://127.0.0.1:7891
+Environment=KEEP_BACKUPS=5
+ExecStart=/opt/wbtasks-sync/sync-upstream.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=900
+# 失败不要静默：同步失败会在 syslog / journalctl -u 里留痕
+StandardOutput=journal
+StandardError=journal
