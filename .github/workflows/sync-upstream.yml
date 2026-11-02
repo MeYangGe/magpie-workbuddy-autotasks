@@ -21,9 +21,9 @@ name: Sync upstream
 
 on:
   schedule:
-    # 每 6 小时一次。GitHub 的 schedule 不保证准点（高峰期可能延迟几十分钟），
+    # 每小时一次。GitHub 的 schedule 不保证准点（高峰期可能延迟几十分钟），
     # 也不保证分钟级——要更实时请用 repository_dispatch 从自己的定时器触发。
-    - cron: "23 */6 * * *"
+    - cron: "23 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:

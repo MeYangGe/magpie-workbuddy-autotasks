@@ -138,7 +138,7 @@ node daemon.mjs --state ./tmp/state --cfg ./tmp/cfg --port 4390
 
 ### 路线 A：仓库自动跟随（默认，无需操作）
 
-`.github/workflows/sync-upstream.yml` 每 6 小时把上游快照拉下来、重放本地补丁、跑 8 项断言，有差异就提交推送到 `main`。手动触发与冲突处理见 README[「自动跟随上游」](./README.md#自动跟随上游)。
+`.github/workflows/sync-upstream.yml` 每小时把上游快照拉下来、重放本地补丁、跑 8 项断言，有差异就提交推送到 `main`。手动触发与冲突处理见 README[「自动跟随上游」](./README.md#自动跟随上游)。
 
 唯一需要确认的仓库设置：`Settings → Actions → General → Workflow permissions` 选 **Read and write**，否则推送会被拒。
 

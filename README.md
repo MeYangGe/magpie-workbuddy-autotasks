@@ -299,11 +299,11 @@ node --test "tests/**/*.test.mjs" "tests-shell/*.test.mjs" "tests-e2e/*.test.mjs
 | `page/index.html` | 外链引入 `embed.js` | 页面 CSP 没有 `unsafe-inline`，内联脚本会被直接丢弃 |
 | `daemon.mjs` | ① `serverOf` 包一层 CORS：对 `Origin: null` 回 `Access-Control-Allow-Origin: null`，并自答 OPTIONS 预检<br>② `checkPluginsFile` 增加「安装目录仍存在」兜底 | ① 沙箱帧是不透明源，不补 CORS 取不回数据；带 JSON 的 POST 会先发预检，光加 ACAO 头不够<br>② 仓库改名后 `spec.includes(PLUGIN_NAME)` 不再命中，托管模式会把插件误判成「已从 magpie 移除」并自杀（表现为看板 `connection refused`） |
 
-这 4 处也被固化成补丁 `tools/local-changes.patch`，供同步脚本重放。
+这 4 处也被固化成补丁 `tools/local-changes.patch`，供同步 workflow 重放。
 
 ### 自动跟随上游
 
-仓库自带 GitHub Actions workflow [`.github/workflows/sync-upstream.yml`](./.github/workflows/sync-upstream.yml)，每 6 小时自动跑一次：
+仓库自带 GitHub Actions workflow [`.github/workflows/sync-upstream.yml`](./.github/workflows/sync-upstream.yml)，每小时自动跑一次：
 
 ```
 按 commit sha 拉上游快照 → 归一化行尾（上游 CRLF、补丁 LF）
@@ -337,7 +337,7 @@ git diff > tools/local-changes.patch
 
 **本仓库自有、不被上游覆盖的路径**：`.github/`、`tools/`、`README.md`、`install.md`、`.gitignore`。上游若改了这些同名文件，workflow 会在 summary 里提示「上游版本与本地不同」，但保持本地版本——要跟进就手工比对。
 
-> GitHub 的 `schedule` 不保证准点，高峰期可能延迟几十分钟；仓库连续 60 天没有任何提交时会被自动暂停，给仓库点个 star 或手动 Run 一次可恢复。
+> GitHub 的 `schedule` 不保证准点，高峰期可能延迟几十分钟；仓库连续 60 天没有任何提交时会被自动暂停，到 Actions 里手动 Run 一次（或随便推个提交）即可恢复。
 
 ### 想让 magpie 直接吃到上游更新（可选）
 
